@@ -1,44 +1,58 @@
-from pyspark import SparkContext
-from pyspark.sql.session import SparkSession
-from pyspark.sql import SQLContext
-import pyspark.sql.functions as func
+#!/usr/bin/env python
+# coding: utf-8
+
+# In[ ]:
+
+
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import year, countDistinct, sum, max, expr, when, first, col
+from pyspark.sql.window import Window
 import sys
-import csv
 
-def parseCSV(idx, part):
-    if idx==0:
-        next(part)
-    for p in csv.reader(part):
-        if ',' in p[1]:
-            p[1] = '\"' + p[1]+ '\"'
-        yield (p[1].lower(), p[7].lower(), int(p[0][:4]))
+if __name__ == "__main__":
+    # Check the number of arguments passed in
+    if len(sys.argv) != 3:
+        print("Usage: BDM_HW3_yl9908.py <input_file> <output_dir>", file=sys.stderr)
+        sys.exit(-1)
 
-def writeToCSV(row):
-    return ', '.join(str(item) for item in row)
+    # Set the input and output paths
+    input_path = sys.argv[1]
+    output_path = sys.argv[2]
 
-def main(sc):
-    spark = SparkSession(sc)
-    sqlContext = SQLContext(sc)
-    rows = sc.textFile(sys.argv[1]).mapPartitionsWithIndex(parseCSV)
-    df = sqlContext.createDataFrame(rows, ('product', 'company', 'date'))
+    # Create a SparkSession
+    spark = SparkSession.builder.appName("BDM_HW3_yl9908").getOrCreate()
 
-    dfComplaintsYearly = df.groupby(['product', 'date']).count().sort('product')
-    dfComplaintsYearly = dfComplaintsYearly.withColumnRenamed("count", "num_complaints")
+    # Load the CSV file into a DataFrame and extract the required columns.
+    complaints_df = spark.read.csv(input_path, header=True, sep=",")
+    complaints_df = complaints_df.select("Product", "Date received", "Company")
 
-    dfCompaniesCount = df.groupby(['product', 'date', 'company']).count()
-    dfCompaniesYearly = dfCompaniesCount.groupby(['product', 'date']).count().sort('product')
-    dfCompaniesYearly = dfCompaniesYearly.withColumnRenamed("count", "num_companies")
+    # Filter out invalid Date received values
+    complaints_df = complaints_df.filter(col("Date received").rlike("^[0-9]{4}"))
 
-    dfMax = dfCompaniesCount.groupBy(['product', 'date']).max('count')
-    dfTotal = dfCompaniesCount.groupBy(['product', 'date']).sum('count')
-    dfRatio = dfMax.join(dfTotal, ['product', 'date'], how='inner')
-    dfRatio = dfRatio.select('product', 'date', func.round(dfRatio[2]/dfRatio[3]*100).cast('integer').alias('percentage'))
+    # Add a new column for the year.
+    complaints_df = complaints_df.withColumn("Year", year(complaints_df["Date received"]))
 
-    dfFinal = dfComplaintsYearly.join(dfCompaniesYearly.join(dfRatio, ['product', 'date'], how='inner'), ['product', 'date'], how='inner')
-    dfFinal = dfFinal.sort('product', 'date')
-    #dfFinal.write.format("csv").save(sys.argv[2])
-    dfFinal.rdd.map(writeToCSV).saveAsTextFile(sys.argv[2])
+    # Fill null values in the Company column with a random company name.
+    complaints_df = complaints_df.withColumn("Company", when(col("Company").isNull(), first("Company", True).over(Window.partitionBy("Product", "Year"))).otherwise(col("Company")))
 
-if __name__=="__main__":
-    sc = SparkContext()
-    main(sc)
+    # Group by Product, Year, and Company and perform the necessary aggregations.
+    grouped_df = complaints_df.groupBy("Product", "Year", "Company")                              .agg(countDistinct("Company").alias("num_categories"),                                   sum(expr("CASE WHEN Company IS NOT NULL THEN 1 ELSE 0 END")).alias("total_companies"))
+
+    # Group by Product and Year to compute the maximum percentage of a single kind of Company.
+    max_pct_df = grouped_df.groupBy("Product", "Year")                           .agg(max(expr("num_categories/total_companies")).alias("max_pct"))
+
+    # Group by Product and Year again to merge rows with the same Product and Year.
+    merged_df = grouped_df.groupBy("Product", "Year")                          .agg(sum("total_companies").alias("total_companies"),                               countDistinct("Company").alias("num_categories"))
+
+    # Join with max_pct_df to get the maximum percentage of a single kind of Company.
+    output_df = merged_df.join(max_pct_df, ["Product", "Year"])                          .select("Product", "Year", "total_companies", "num_categories", expr("ROUND(max_pct, 0)").cast("int").alias("max_pct"))                          .orderBy("Product", "Year")
+
+    # Convert output_df to an RDD of CSV strings.
+    output_rdd = output_df.rdd.map(lambda x: ",".join(str(i) for i in x))
+
+    # Save the output to a text file.
+    output_rdd.saveAsTextFile(output_path)
+
+    # Stop the SparkSession
+    spark.stop()
+
